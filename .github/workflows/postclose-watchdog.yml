@@ -1,0 +1,60 @@
+name: 盘后兜底自检（post-close watchdog）
+on:
+  schedule:
+    - cron: '35 9,11,13 * * 1-5'
+    - cron: '20 0 * * 2-6'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: alpha-quant-hub-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TZ: Asia/Shanghai
+      WATCHDOG_ROOT: '.'
+      WATCHDOG_GLOBS: 'reports/{D}.md'
+      MAIN_WORKFLOW: 'daily.yml'
+      MAIN_NAME: '全策略盘后每日候选扫描'
+    steps:
+      - uses: actions/checkout@v4
+      - name: 检查当日盘后候选是否缺失
+        id: need
+        run: |
+          rc=0
+          python3 scripts/postclose_watchdog.py > /tmp/wd.json || rc=$?
+          cat /tmp/wd.json
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -eq 10 ]; then echo "missing=true" >> "$GITHUB_OUTPUT"; else echo "missing=false" >> "$GITHUB_OUTPUT"; fi
+      - name: 检查主流程近 4 小时是否已运行
+        if: steps.need.outputs.missing == 'true'
+        id: recent
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -s -H "authorization: bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=25" > /tmp/runs.json || echo '{}' > /tmp/runs.json
+          n=$(MAIN_NAME="$MAIN_NAME" python3 -c 'import datetime as dt,json,os; runs=json.load(open("/tmp/runs.json")).get("workflow_runs",[]); name=os.environ["MAIN_NAME"]; now=dt.datetime.now(dt.timezone.utc); print(sum(1 for r in runs if r.get("name")==name and (now-dt.datetime.strptime(r["created_at"],"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)).total_seconds()<=14400))')
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+      - name: 缺失则自动触发主流程补扫
+        if: steps.need.outputs.missing == 'true' && steps.recent.outputs.count == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "authorization: bearer $GH_TOKEN" -H "content-type: application/json" \
+            -d '{"ref":"${{ github.ref_name }}"}' \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$MAIN_WORKFLOW/dispatches")
+          echo "dispatch http $code"
+          if [ "$code" != "204" ]; then
+            echo "::error::dispatch 返回 $code，请手动在 Actions 运行 $MAIN_WORKFLOW"
+            exit 1
+          fi

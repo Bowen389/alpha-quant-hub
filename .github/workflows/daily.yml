@@ -1,0 +1,63 @@
+name: 全策略盘后每日候选扫描
+on:
+  schedule:
+    # UTC -> 北京时间 17:00 / 18:00 / 21:00 及次日 08:30 兜底
+    - cron: '0 9 * * 1-5'
+    - cron: '0 10 * * 1-5'
+    - cron: '0 13 * * 1-5'
+    - cron: '30 0 * * 2-6'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: '北京时间交易日 YYYY-MM-DD，留空自动用当日/最近交易日'
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths: ['scan_daily.py', 'market_data.py', 'requirements.txt', '.github/workflows/daily.yml']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: alpha-quant-hub-daily-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - run: git pull --ff-only origin main || true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: 扫描全部 S 梯队策略次日候选
+        id: scan
+        env:
+          REPORT_DATE: ${{ inputs.date }}
+          TRIGGER: ${{ github.event_name }}
+        run: |
+          args=()
+          if [ -n "$REPORT_DATE" ]; then args+=(--date "$REPORT_DATE"); fi
+          if [ "$TRIGGER" = "schedule" ]; then args+=(--retry); fi
+          python scan_daily.py "${args[@]}"
+      - name: 发布每日候选报告
+        if: always() && (steps.scan.outcome == 'success' || steps.scan.outcome == 'failure')
+        run: |
+          git add reports/
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "Publish daily strategy candidates"
+          git pull --rebase origin main
+          git push origin HEAD:main
+          if [ -f reports/latest.md ]; then cat reports/latest.md >> "$GITHUB_STEP_SUMMARY"; fi
