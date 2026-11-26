@@ -546,7 +546,8 @@ def render_markdown(res: dict) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Alpha Quant Hub Daily Candidate Scanner")
     parser.add_argument("--date", default="", help="Trading date YYYY-MM-DD (default: today CST)")
-    parser.add_argument("--retry", action="store_true", help="Retry cloud fetch up to 3 times if post-close data lags")
+    parser.add_argument("--retry", action="store_true", help="Retry cloud fetch up to 5 times if post-close data lags")
+    parser.add_argument("--skip-if-exists", action="store_true", help="Skip if reports/{date}.md already exists (for backup cron slots)")
     parser.add_argument("--local-tdx", default="", help="Optional local TDX Parquet cache dir for offline execution")
     args = parser.parse_args()
 
@@ -556,7 +557,10 @@ def main():
         ds = load_local_tdx_dataset(args.local_tdx, asof=args.date or None)
     else:
         asof = args.date.strip() or datetime.now(SH_TZ).strftime("%Y-%m-%d")
-        attempts = 3 if args.retry else 1
+        if args.skip_if_exists and (REPORTS_DIR / f"{asof}.md").exists():
+            print(f"[SKIP] reports/{asof}.md already published. Exiting cleanly.")
+            sys.exit(0)
+        attempts = 5 if args.retry else 1
         ds = None
         for i in range(attempts):
             try:
@@ -566,7 +570,7 @@ def main():
                 print(f"[WARN] Cloud fetch attempt {i+1}/{attempts} failed: {exc}", flush=True)
                 if i + 1 == attempts:
                     raise
-                sleep(90)
+                sleep(120)
         if not ds or not ds.get("is_trading_day"):
             print(f"[INFO] {asof} is not a trading day. Skipping report generation.")
             sys.exit(0)

@@ -1,10 +1,10 @@
 name: 全策略盘后每日候选扫描
 on:
   schedule:
-    # UTC -> 北京时间 17:00 / 18:00 / 21:00 及次日 08:30 兜底
-    - cron: '0 9 * * 1-5'
+    # UTC -> 北京时间 17:15 / 18:00 / 20:00 及次日 08:30 兜底
+    - cron: '15 9 * * 1-5'
     - cron: '0 10 * * 1-5'
-    - cron: '0 13 * * 1-5'
+    - cron: '0 12 * * 1-5'
     - cron: '30 0 * * 2-6'
   workflow_dispatch:
     inputs:
@@ -48,7 +48,7 @@ jobs:
         run: |
           args=()
           if [ -n "$REPORT_DATE" ]; then args+=(--date "$REPORT_DATE"); fi
-          if [ "$TRIGGER" = "schedule" ]; then args+=(--retry); fi
+          if [ "$TRIGGER" = "schedule" ]; then args+=(--retry --skip-if-exists); fi
           python scan_daily.py "${args[@]}"
       - name: 发布每日候选报告
         if: always() && (steps.scan.outcome == 'success' || steps.scan.outcome == 'failure')

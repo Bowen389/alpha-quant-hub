@@ -71,16 +71,21 @@ def _fetch_tencent(endpoint: str, params: str) -> dict:
     raise RuntimeError("unreachable")
 
 
-def query_exchange_calendar_and_stocks(asof: str) -> tuple[str | None, dict[str, str] | None]:
-    """Query BaoStock for trading day status, next trading date, and active Main-Board non-ST list."""
+def query_exchange_calendar_and_stocks(asof: str) -> tuple[str | None, dict[str, str] | None, dict[str, str]]:
+    """Query BaoStock for trading day status, next trading date, active Main-Board non-ST list, and industry tags.
+
+    If BaoStock has not published `query_all_stock(day=asof)` yet (common between 16:15 and 17:45 BJT),
+    automatically falls back to the most recent prior trading day's stock roster while Tencent fetches today's bars.
+    """
     import baostock as bs
 
     lg = bs.login()
     if lg.error_code != "0":
         raise RuntimeError(f"BaoStock login failed: {lg.error_msg}")
     try:
+        beg_d = (date.fromisoformat(asof) - timedelta(days=15)).isoformat()
         end_d = (date.fromisoformat(asof) + timedelta(days=20)).isoformat()
-        rs = bs.query_trade_dates(start_date=asof, end_date=end_d)
+        rs = bs.query_trade_dates(start_date=beg_d, end_date=end_d)
         if rs.error_code != "0":
             raise RuntimeError(rs.error_msg)
         cal = rs.get_data()
@@ -88,21 +93,35 @@ def query_exchange_calendar_and_stocks(asof: str) -> tuple[str | None, dict[str,
         if row.empty:
             raise RuntimeError(f"Calendar missing {asof}")
         if row.iloc[0]["is_trading_day"] != "1":
-            return None, None
+            return None, None, {}
         fut = cal[(cal["calendar_date"] > asof) & (cal["is_trading_day"] == "1")]
         next_day = str(fut.iloc[0]["calendar_date"]) if not fut.empty else "下一交易日"
 
-        st = bs.query_all_stock(day=asof)
-        if st.error_code != "0":
-            raise RuntimeError(st.error_msg)
-        recs = []
-        while st.next():
-            recs.append(st.get_row_data())
-        df = pd.DataFrame.from_records(recs, columns=st.fields)
-        df["code"] = df["code"].str.split(".").str[-1]
-        df = df[df["code"].str.fullmatch(MAIN_RE) & (df["tradeStatus"] == "1")]
+        # Try `asof` first, then up to 5 previous trading days if today's BaoStock roster is not published yet
+        past_tdays = list(cal[(cal["calendar_date"] <= asof) & (cal["is_trading_day"] == "1")]["calendar_date"].sort_values(ascending=False))[:6]
+        df = pd.DataFrame()
+        used_day = asof
+        for cand_day in past_tdays:
+            st = bs.query_all_stock(day=str(cand_day))
+            if st.error_code != "0":
+                continue
+            recs = []
+            while st.next():
+                recs.append(st.get_row_data())
+            if not recs:
+                continue
+            tmp = pd.DataFrame.from_records(recs, columns=st.fields)
+            tmp["code"] = tmp["code"].str.split(".").str[-1]
+            tmp = tmp[tmp["code"].str.fullmatch(MAIN_RE) & (tmp["tradeStatus"] == "1")]
+            if len(tmp) >= 2500:
+                df = tmp
+                used_day = str(cand_day)
+                break
         if len(df) < 2500:
-            raise RuntimeError(f"Abnormal Main-Board stock count: {len(df)}")
+            raise RuntimeError(f"Abnormal Main-Board stock count across {past_tdays}: {len(df)}")
+        if used_day != asof:
+            print(f"[CLOUD] BaoStock roster for {asof} not published yet -> seamlessly fell back to {used_day} ({len(df)} stocks)", flush=True)
+
         names = {}
         for _, r in df.iterrows():
             nm = str(r["code_name"])
@@ -111,7 +130,29 @@ def query_exchange_calendar_and_stocks(asof: str) -> tuple[str | None, dict[str,
             code = str(r["code"])
             sym = ("sh" if code.startswith("6") else "sz") + code
             names[sym] = nm
-        return next_day, names
+
+        # Best-effort Chinese industry lookup (never blocks daily scan if unavailable)
+        ind_names: dict[str, str] = {}
+        try:
+            rs_ind = bs.query_stock_industry()
+            if rs_ind.error_code == "0":
+                irecs = []
+                while rs_ind.next():
+                    irecs.append(rs_ind.get_row_data())
+                if irecs:
+                    idf = pd.DataFrame.from_records(irecs, columns=rs_ind.fields)
+                    for _, r in idf.iterrows():
+                        raw_c = str(r.get("code", ""))
+                        ind_v = str(r.get("industry", "")).strip()
+                        if "." in raw_c and ind_v:
+                            mkt, num = raw_c.split(".", 1)
+                            # Strip leading alphanumeric classification codes like "C39 " if present
+                            ind_clean = re.sub(r"^[A-Z]\d+\s*", "", ind_v).strip() or ind_v
+                            ind_names[mkt.lower() + num] = ind_clean
+        except Exception as exc:
+            print(f"[WARN] BaoStock industry lookup skipped: {exc}", flush=True)
+
+        return next_day, names, ind_names
     finally:
         bs.logout()
 
@@ -126,7 +167,7 @@ def _parse_tencent_bars(rows: list, cols: list[str], idxs: list[int]) -> pd.Data
 
 def fetch_cloud_dataset(asof: str, lookback_bars: int = 135) -> dict:
     """Fetch all required cloud data (indices, Main-Board stocks, 46 ETFs) for `asof`."""
-    next_day, names = query_exchange_calendar_and_stocks(asof)
+    next_day, names, ind_names = query_exchange_calendar_and_stocks(asof)
     if next_day is None or names is None:
         return {"is_trading_day": False, "asof": asof}
 
@@ -199,7 +240,7 @@ def fetch_cloud_dataset(asof: str, lookback_bars: int = 135) -> dict:
         "etf_bars": etf_bars,
         "stock_bars": stock_bars,
         "names": names,
-        "ind_names": {},
+        "ind_names": ind_names,
     }
 
 
