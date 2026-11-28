@@ -193,10 +193,13 @@ def fetch_cloud_dataset(asof: str, lookback_bars: int = 135) -> dict:
         for fut in as_completed([ex.submit(_fetch_etf, s) for s in ALL_TARGET_ETFS]):
             try:
                 sym, df = fut.result()
-                if len(df) >= 60:
+                if len(df) >= 60 and str(df.index[-1]) == asof:
                     etf_bars[sym] = df
             except Exception:
                 pass
+    etf_cov = len(etf_bars) / max(len(ALL_TARGET_ETFS), 1)
+    if etf_cov < 0.90:
+        raise RuntimeError(f"ETF bars not fully updated to {asof} yet: {len(etf_bars)}/{len(ALL_TARGET_ETFS)}")
 
     # 3. Dynamic Main-Board stocks (raw + qfq)
     since = (date.fromisoformat(asof) - timedelta(days=230)).isoformat()

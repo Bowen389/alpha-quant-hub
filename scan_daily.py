@@ -78,8 +78,13 @@ def compute_etf_signal(etf_bars: dict[str, pd.DataFrame], hs300: pd.Series) -> d
     hs_above_ma60 = hs_c >= hs_ma60
 
     dom_rows = []
+    all_dom_rows = []
     ov_rows = []
     trend_hits = 0
+    above_ma5_hits = 0
+    above_ma10_hits = 0
+    above_ma20_hits = 0
+    above_ma60_hits = 0
     dom_valid = 0
     ret_map = {}
 
@@ -90,8 +95,15 @@ def compute_etf_signal(etf_bars: dict[str, pd.DataFrame], hs300: pd.Series) -> d
             continue
         arr = cs.to_numpy(dtype=float)
         c0 = float(arr[-1])
+        c1 = float(arr[-2])
+        c5 = float(arr[-6])
+        c20 = float(arr[-21])
+        ma5 = float(arr[-5:].mean())
+        ma10 = float(arr[-10:].mean())
         ma20 = float(arr[-20:].mean())
         ma60 = float(arr[-60:].mean())
+        above_ma20 = bool(c0 > ma20)
+        above_ma60 = bool(c0 > ma60)
         trend_ok = bool(c0 > ma20 and ma20 > ma60)
         vol_ratio = float(vs.iloc[-1] / max(vs.iloc[-21:-1].mean(), 1.0))
         vol_spike = bool(vol_ratio > 2.0)
@@ -100,20 +112,47 @@ def compute_etf_signal(etf_bars: dict[str, pd.DataFrame], hs300: pd.Series) -> d
         ann_vol = float(np.std(rets20, ddof=1) * np.sqrt(252.0)) if len(rets20) >= 15 else 0.25
         ret_map[sym] = rets20
 
+        if trend_ok:
+            status = "✅ 严格多头"
+        elif above_ma20:
+            status = "🟡 站上MA20(拐点)"
+        elif c0 > ma5:
+            status = "🔸 反弹站上MA5"
+        else:
+            status = "⚪ 弱势"
+
         item = {
             "symbol": sym,
             "name": ALL_TARGET_ETFS.get(sym, sym),
             "close": round(c0, 3),
+            "r1_pct": round((c0 / c1 - 1.0) * 100.0, 2) if c1 > 0 else 0.0,
+            "r5_pct": round((c0 / c5 - 1.0) * 100.0, 2) if c5 > 0 else 0.0,
+            "r20_pct": round((c0 / c20 - 1.0) * 100.0, 2) if c20 > 0 else 0.0,
+            "vs_ma20_pct": round((c0 / ma20 - 1.0) * 100.0, 2) if ma20 > 0 else 0.0,
+            "vs_ma60_pct": round((c0 / ma60 - 1.0) * 100.0, 2) if ma60 > 0 else 0.0,
             "score": round(sc, 3) if np.isfinite(sc) else None,
             "r2": round(r2, 3) if np.isfinite(r2) else None,
             "ann_vol": round(ann_vol, 3),
+            "vol_ratio": round(vol_ratio, 2),
+            "above_ma20": above_ma20,
+            "above_ma60": above_ma60,
             "trend_ok": trend_ok,
             "vol_spike": vol_spike,
+            "status": status,
         }
         if sym in DOMESTIC_EQUITY_ETFS:
             dom_valid += 1
+            if c0 > ma5:
+                above_ma5_hits += 1
+            if c0 > ma10:
+                above_ma10_hits += 1
+            if above_ma20:
+                above_ma20_hits += 1
+            if above_ma60:
+                above_ma60_hits += 1
             if trend_ok:
                 trend_hits += 1
+            all_dom_rows.append(item)
             if trend_ok and (not vol_spike) and np.isfinite(sc) and sc > 0:
                 dom_rows.append(item)
         elif sym in OVERSEAS_CORE_ETFS:
@@ -122,8 +161,10 @@ def compute_etf_signal(etf_bars: dict[str, pd.DataFrame], hs300: pd.Series) -> d
 
     breadth = trend_hits / max(dom_valid, 1)
     dom_gate_on = bool(hs_above_ma60 or breadth >= 0.20)
-    dom_rows.sort(key=lambda x: -(x["score"] or -999))
-    ov_rows.sort(key=lambda x: -(x["score"] or -999))
+    dom_rows.sort(key=lambda x: -(x["score"] if x["score"] is not None else -999))
+    all_dom_by_score = sorted(all_dom_rows, key=lambda x: -(x["score"] if x["score"] is not None else -999))
+    all_dom_by_r5 = sorted(all_dom_rows, key=lambda x: -x["r5_pct"])
+    ov_rows.sort(key=lambda x: -(x["score"] if x["score"] is not None else -999))
 
     # Pair correlation dedup (< 0.75) for domestic top 2
     dom_picks = []
@@ -168,9 +209,16 @@ def compute_etf_signal(etf_bars: dict[str, pd.DataFrame], hs300: pd.Series) -> d
         "domestic_gate_on": dom_gate_on,
         "hs300_above_ma60": hs_above_ma60,
         "domestic_breadth": round(breadth, 4),
+        "dom_valid": dom_valid,
+        "above_ma5_breadth": round(above_ma5_hits / max(dom_valid, 1), 4),
+        "above_ma10_breadth": round(above_ma10_hits / max(dom_valid, 1), 4),
+        "above_ma20_breadth": round(above_ma20_hits / max(dom_valid, 1), 4),
+        "above_ma60_breadth": round(above_ma60_hits / max(dom_valid, 1), 4),
         "targets": targets,
         "cash_weight": cash_w,
         "top_domestic": dom_rows[:6],
+        "dom_watch_score": all_dom_by_score[:10],
+        "dom_watch_rebound": all_dom_by_r5[:8],
         "overseas_status": ov_rows,
     }
 
@@ -512,7 +560,8 @@ def render_markdown(res: dict) -> str:
         "## 四、#4 旗舰：`AlphaFlow-Switch-22` 纯权益 ETF 轮动（0 债 0 黄金）",
         "",
         f"- **当前状态**：**{e['state']}**",
-        f"- **国内门控**：`{'ON' if e['domestic_gate_on'] else 'OFF'}`（沪深300≥MA60: `{e['hs300_above_ma60']}`，国内42只纯权益ETF多头广度: `{e['domestic_breadth']*100:.1f}%`，阈值 `20%`）",
+        f"- **国内门控**：`{'ON' if e['domestic_gate_on'] else 'OFF'}`（沪深300≥MA60: `{e['hs300_above_ma60']}`，国内{e.get('dom_valid', 42)}只纯权益ETF严格多头广度: `{e['domestic_breadth']*100:.1f}%`，阈值 `20%`）",
+        f"- **拐点先行宽度**：`>MA5`: `{e.get('above_ma5_breadth', 0.0)*100:.0f}%` ｜ `>MA10`: `{e.get('above_ma10_breadth', 0.0)*100:.0f}%` ｜ `>MA20`: `{e.get('above_ma20_breadth', 0.0)*100:.0f}%` ｜ `>MA60`: `{e.get('above_ma60_breadth', 0.0)*100:.0f}%`",
         f"- **明日开盘目标持仓**（剩余现金权重：**`{e['cash_weight']*100:.1f}%`**）：",
         "",
     ]
@@ -523,9 +572,37 @@ def render_markdown(res: dict) -> str:
     else:
         lines.append("**100% 纯现金空仓避险（0 债基、0 黄金）。**")
 
-    lines += ["", "**海外 4 核纯权益替补状态（`R² >= 0.40` 且多头趋势达标）：**", "", "| 代码 | 名称 | 现价 | 动量分 | R² | 趋势达标 | 是否合格 |", "| :--- | :--- | ---: | ---: | ---: | :---: | :---: |"]
+    if e.get("dom_watch_score"):
+        lines += [
+            "",
+            "**国内纯权益 ETF 40 日动量排名前 10 观察池（无论门控开关均展示，原生策略候选排序）：**",
+            "",
+            "| 排名 | 代码 | 名称 | 现价 | 1日% | 5日% | 20日% | 距MA20 | 距MA60 | 动量分 | R² | 趋势状态 |",
+            "| :---: | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |",
+        ]
+        for i, d in enumerate(e["dom_watch_score"], 1):
+            lines.append(
+                f"| {i} | `{d['symbol']}` | **{d['name']}** | {d['close']:.3f} | {d['r1_pct']:+.2f}% | {d['r5_pct']:+.2f}% | {d['r20_pct']:+.2f}% | {d['vs_ma20_pct']:+.2f}% | {d['vs_ma60_pct']:+.2f}% | {d['score']} | {d['r2']} | {d['status']} |"
+            )
+
+    if e.get("dom_watch_rebound"):
+        lines += [
+            "",
+            "**国内纯权益 ETF 近 5 日领涨反弹前 8（左侧/右侧拐点先手观察，不替代严格门控）：**",
+            "",
+            "| 排名 | 代码 | 名称 | 现价 | 1日% | 5日% | 20日% | 距MA20 | 距MA60 | 动量分 | 趋势状态 |",
+            "| :---: | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |",
+        ]
+        for i, d in enumerate(e["dom_watch_rebound"], 1):
+            lines.append(
+                f"| {i} | `{d['symbol']}` | **{d['name']}** | {d['close']:.3f} | {d['r1_pct']:+.2f}% | {d['r5_pct']:+.2f}% | {d['r20_pct']:+.2f}% | {d['vs_ma20_pct']:+.2f}% | {d['vs_ma60_pct']:+.2f}% | {d['score']} | {d['status']} |"
+            )
+
+    lines += ["", "**海外 4 核纯权益替补状态（`R² >= 0.40` 且多头趋势达标）：**", "", "| 代码 | 名称 | 现价 | 1日% | 5日% | 距MA20 | 动量分 | R² | 趋势达标 | 是否合格 |", "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: |"]
     for o in e["overseas_status"]:
-        lines.append(f"| `{o['symbol']}` | {o['name']} | {o['close']:.3f} | {o['score']} | {o['r2']} | {'YES' if o['trend_ok'] else 'NO'} | **{'✅ 合格' if o['qualified'] else '❌ 不达标'}** |")
+        lines.append(
+            f"| `{o['symbol']}` | {o['name']} | {o['close']:.3f} | {o.get('r1_pct', 0.0):+.2f}% | {o.get('r5_pct', 0.0):+.2f}% | {o.get('vs_ma20_pct', 0.0):+.2f}% | {o['score']} | {o['r2']} | {'YES' if o['trend_ok'] else 'NO'} | **{'✅ 合格' if o['qualified'] else '❌ 不达标'}** |"
+        )
 
     lines += [
         "",
